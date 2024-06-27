@@ -1,7 +1,7 @@
-require("dotenv").config();
 const Agenda = require("agenda");
 const nodemailer = require("nodemailer");
 const Job = require("../models/Job");
+const CompletedJob = require("../models/completedJob");
 const cronParser = require("cron-parser");
 
 const mongoConnectionString = process.env.MONGODB_URI;
@@ -12,7 +12,6 @@ const agenda = new Agenda({
   maxConcurrency: 20,
 });
 
-// Setup email transporter
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -21,7 +20,6 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Define the job to send email
 agenda.define(
   "send email",
   { priority: "high", concurrency: 10 },
@@ -35,6 +33,8 @@ agenda.define(
       return;
     }
 
+    const startTime = now;
+
     try {
       await transporter.sendMail({
         from: process.env.EMAIL_USER,
@@ -42,35 +42,62 @@ agenda.define(
         subject: subject,
         text: body,
       });
+
+      const curr_date = new Date();
+      const duration = (curr_date - startTime) / 1000;
+      const completedJobData = {
+        jobID: job.attrs._id,
+        cronExpression: job.attrs.data.cronExpression,
+        status: "success",
+        lastFinishedAt: curr_date,
+        startTime: startTime,
+        failReason: "",
+        duration,
+      };
+      await CompletedJob.create(completedJobData);
       await Job.findByIdAndUpdate(job.attrs._id, {
         status: "sent",
         lastFinishedAt: new Date(),
+        duration,
       });
-
-      const nextRun = cronParser
-        .parseExpression(cronExpression)
-        .next()
-        .toDate();
-      if (nextRun < new Date(jobEndDate)) {
-        job.schedule(nextRun);
-        await job.save();
-      }
     } catch (error) {
       job.attrs.failCount = job.attrs.failCount ? job.attrs.failCount + 1 : 1;
       job.fail(error.message);
+
+      const duration = (new Date() - startTime) / 1000;
+      const completedJobData = {
+        jobID: job.attrs._id,
+        cronExpression: job.attrs.data.cronExpression,
+        status: "failed",
+        lastFinishedAt: new Date(),
+        startTime: startTime,
+        failReason: error.message,
+        duration,
+      };
+      await CompletedJob.create(completedJobData);
       await Job.findByIdAndUpdate(job.attrs._id, {
         status: "failed",
         retries: job.attrs.failCount,
+        duration,
       });
+    }
+
+    const nextRun = cronParser.parseExpression(cronExpression).next().toDate();
+    if (nextRun < new Date(jobEndDate)) {
+      job.schedule(nextRun);
+      await job.save();
     }
   }
 );
 
-// Handle job failure
 agenda.on("fail:send email", async (err, job) => {
+  await Job.findByIdAndUpdate(job.attrs._id, {
+    status: "failed",
+    lastFinishedAt: new Date(),
+  });
   const retryLimit = 5;
   if (job.attrs.failCount < retryLimit) {
-    job.schedule("in 1 minute");
+    job.attrs.nextRunAt = new Date();
     await job.save();
   } else {
     await Job.findByIdAndUpdate(job.attrs._id, {
@@ -79,7 +106,6 @@ agenda.on("fail:send email", async (err, job) => {
   }
 });
 
-// Handle job success
 agenda.on("success:send email", async (job) => {
   await Job.findByIdAndUpdate(job.attrs._id, {
     status: "sent",
@@ -87,9 +113,14 @@ agenda.on("success:send email", async (job) => {
   });
 });
 
-// Start agenda
+agenda.define("cleanup completed jobs", async () => {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  await CompletedJob.deleteMany({ createdAt: { $lt: oneHourAgo } });
+});
+
 (async function () {
   await agenda.start();
+  await agenda.every("1 hour", "cleanup completed jobs");
 })();
 
 module.exports = agenda;
